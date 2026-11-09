@@ -37,7 +37,8 @@ jobs:
           }
           if (-not $exe) { throw "no LLVM release from 23 on with an x86-64 Windows package" }
           New-Item -ItemType Directory -Force C:\LLVM23 | Out-Null
-          tar -xf $exe -C C:\LLVM23 --strip-components=1
+          # Windows' own tar (bsdtar): Git's GNU tar takes the drive letter of a path for a remote host. Only the tools and clang's headers.
+          & "$env:SystemRoot\System32\tar.exe" -xf $exe -C C:\LLVM23 --strip-components=1 '*/bin/*' '*/lib/clang/*'
           if ($LASTEXITCODE) { throw "tar failed" }
           & 'C:\LLVM23\bin\clang-cl.exe' --version
           "NX_LLVM_BIN=C:\LLVM23\bin" >> $env:GITHUB_ENV
