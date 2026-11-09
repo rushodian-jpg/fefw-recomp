@@ -17,12 +17,26 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = gh release view -R llvm/llvm-project --json tagName -q .tagName
-          $ver = $tag -replace '^llvmorg-', ''
-          Write-Host "latest LLVM release: $ver"
-          if ([int]($ver.Split('.')[0]) -lt 23) { throw "the latest LLVM release is $ver; the build needs 23 or newer" }
-          gh release download $tag -R llvm/llvm-project -p "LLVM-$ver-win64.exe" -D $env:RUNNER_TEMP
-          Start-Process "$env:RUNNER_TEMP\LLVM-$ver-win64.exe" -ArgumentList '/S', '/D=C:\LLVM23' -Wait
+          $ErrorActionPreference = 'Stop'
+          # the newest release (23 or newer) that has the Windows installer: a point release may not have it yet
+          $tags = gh release list -R llvm/llvm-project --limit 30 --exclude-pre-releases --json tagName -q '.[].tagName'
+          $exe = $null
+          foreach ($tag in $tags) {
+              $ver = $tag -replace '^llvmorg-', ''
+              if ($ver -notmatch '^\d+\.' -or [int]($ver.Split('.')[0]) -lt 23) { continue }
+              $names = gh release view $tag -R llvm/llvm-project --json assets -q '.assets[].name'
+              $name = $names | Where-Object { $_ -match '^LLVM-.*win64\.exe$' } | Select-Object -First 1
+              if ($name) {
+                  Write-Host "LLVM $ver`: $name"
+                  gh release download $tag -R llvm/llvm-project -p $name -D $env:RUNNER_TEMP
+                  if ($LASTEXITCODE) { throw "download failed" }
+                  $exe = Join-Path $env:RUNNER_TEMP $name
+                  break
+              }
+              Write-Host "LLVM $ver has no Windows installer; its Windows assets: $(($names | Where-Object { $_ -match 'win' }) -join ', ')"
+          }
+          if (-not $exe) { throw "no LLVM release from 23 on with a win64 installer" }
+          Start-Process $exe -ArgumentList '/S', '/D=C:\LLVM23' -Wait
           & 'C:\LLVM23\bin\clang-cl.exe' --version
           "NX_LLVM_BIN=C:\LLVM23\bin" >> $env:GITHUB_ENV
       - name: Ninja
