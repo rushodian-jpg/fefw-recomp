@@ -13,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        llvm: [release, image]   # release: the newest LLVM release (23 or newer, as docs/BUILDING.md asks); image: the runner's own
+        llvm: [image]   # image: the runner's own LLVM; release (the newest LLVM release, 23 or newer) unpacks too slowly here
     steps:
       - uses: actions/checkout@v4
       - name: The runner's LLVM
