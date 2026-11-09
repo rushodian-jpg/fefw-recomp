@@ -51,4 +51,9 @@ float framegen_shown_ratio();
 // sl.interposer.dll's export `name` (temporal_dlss.cpp); null when Streamline was not started.
 void* streamline_proc(const char* name);
 
+// Whether a Streamline call did its work (temporal_dlss.cpp). `result` is its sl::Result: eOk, or eWarnOutOfVRAM, which Streamline returns in
+// place of eOk when the call succeeded and the card's video memory budget is used up (a warning, logged here at most once per 30 s with
+// `what`, the call's name). Anything else is a failure.
+bool streamline_ok(int result, const char* what);
+
 }  // namespace nxrt::extras
