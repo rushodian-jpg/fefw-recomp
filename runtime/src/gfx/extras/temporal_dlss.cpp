@@ -163,7 +163,10 @@ public:
                     }
                 }
             }
-            if ((m != last_mode_ || !same_out) && s.set_options(vp, options(m, f.out)) != sl::Result::eOk) return fail("slDLSSSetOptions");
+            if (m != last_mode_ || !same_out) {
+                const sl::Result sr = s.set_options(vp, options(m, f.out));
+                if (!streamline_ok(static_cast<int>(sr), "slDLSSSetOptions")) return fail("slDLSSSetOptions", static_cast<int>(sr));
+            }
             if (m != last_mode_ || !same_out)
                 NXLOG_I(kTag, "%s: mode %s, %ux%u -> %ux%u (input range %ux%u .. %ux%u)", name(), mode_name(m), f.render.width, f.render.height, f.out.width,
                         f.out.height, rg.min_w, rg.min_h, rg.max_w, rg.max_h);
@@ -206,7 +209,8 @@ public:
         if (s.tag(*frame, vp, tags, 4, slcb) != sl::Result::eOk) return fail("slSetTagForFrame");
         const sl::BaseStructure* inputs[] = {&vp};
         const sl::Result er = s.evaluate(sl::kFeatureDLSS, *frame, inputs, 1, slcb);
-        if (er != sl::Result::eOk) return fail("slEvaluateFeature", static_cast<int>(er));
+        // eWarnOutOfVRAM: the evaluation ran (Streamline only replaces eOk with it), so the output is valid and DLSS stays on.
+        if (!streamline_ok(static_cast<int>(er), "slEvaluateFeature")) return fail("slEvaluateFeature", static_cast<int>(er));
         return true;
     }
 
@@ -361,6 +365,18 @@ PFN_vkGetInstanceProcAddr streamline_preinit() {
     NXLOG_I(kTag, "Streamline %d.%d.%d started from %s: the Vulkan instance and device are created through it", SL_VERSION_MAJOR, SL_VERSION_MINOR,
             SL_VERSION_PATCH, narrow(dir).c_str());
     return gipa;
+}
+
+bool streamline_ok(int result, const char* what) {
+    const sl::Result r = static_cast<sl::Result>(result);
+    if (r == sl::Result::eOk) return true;
+    if (r != sl::Result::eWarnOutOfVRAM) return false;
+    static std::atomic<uint64_t> last{0};
+    const uint64_t now = GetTickCount64();
+    uint64_t prev = last.load(std::memory_order_relaxed);
+    if ((!prev || now - prev >= 30000) && last.compare_exchange_strong(prev, now ? now : 1, std::memory_order_relaxed))
+        NXLOG_W(kTag, "%s: Streamline reports the video memory budget is used up (eWarnOutOfVRAM): the call did its work, DLSS stays on; stutter is likely until memory is freed", what);
+    return true;
 }
 
 bool streamline_framegen_available() { return sl_state().started && sl_state().framegen; }
