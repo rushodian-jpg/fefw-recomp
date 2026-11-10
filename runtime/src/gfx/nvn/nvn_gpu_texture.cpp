@@ -91,6 +91,10 @@ struct TexGpu {
     // idle textures (tex_idle_sweep): an image with memory of its own that no draw sampled for a while has its memory priority lowered,
     // so that video memory over the budget is taken from it first; the next tex_sampled_view raises it again
     uint32_t created_at = 0;                            // present count when the image was made
+    // reduced detail (tex_top_level_from): the image starts at NVN level `skip` (base and levels describe the image, so NVN level L is
+    // image level L - skip). Only sampled, transcoded textures; tex_full_detail remakes the image whole when a copy or clear names it.
+    uint32_t skip = 0;
+    bool full_detail = false;                           // remade whole once: stays whole
     std::atomic<bool> demoted{false};
 };
 
@@ -524,17 +528,30 @@ bool create_sparse_texture(Texture* t, TexGpu* g, const Shape& s, std::string* w
 // ---- idle textures ------------------------------------------------------------------------------------------------------------------
 // The game keeps the textures of places it left, and the GPU cannot tell them from the ones a draw needs: with video memory over the
 // budget the system moves memory out by priority (VK_EXT_pageable_device_local_memory), and every texture has the same one. So a texture
-// with memory of its own that no draw has sampled for [nvn] texture_idle_presents presents (1800: half a minute at 60 fps; 0 turns this
-// off) is set to the lowest priority, and back to the normal one at its next tex_sampled_view. Nothing is freed and no data is lost: a
+// with memory of its own that no draw has sampled for [nvn] texture_idle_presents presents (for example 1800: half a minute at 60 fps; 0,
+// the default, turns this off: the pool arrays ask a sampled view of every registered texture when they are rewritten, so the count says
+// less than it should) is set to the lowest priority, and back to the normal one at its next tex_sampled_view. Nothing is freed and no data is lost: a
 // lowered texture that is sampled again is at worst brought back by the driver.
 constexpr float kTexPriority = 0.5f;                    // Device::create_image's priority of a sampled image
 constexpr float kTexIdlePriority = 0.0f;
 constexpr uint64_t kOwnMemoryTexels = 512ull * 512;     // smaller textures stay in the allocator's shared blocks
 std::atomic<uint64_t> g_idle_lowered{0}, g_idle_raised{0};
 
+// ---- reduced texture detail -----------------------------------------------------------------------------------------------------------
+// An ASTC texture is stored as BC7 here, at four times its size on the console: on an 8 GB card the game's textures alone pass 4 GB and
+// the process runs over the video memory budget. The first level of a mipmapped texture holds three quarters of its bytes and is the one
+// a 1080p frame samples least. [nvn] texture_top_level_from = N (0: off) leaves that level out of the image for transcoded 2D textures
+// whose longer side is N texels or more: the image starts at NVN level 1. Sampling by normalized coordinates is unchanged apart from the
+// lost level; textureSize and texelFetch on such a texture see the smaller image.
+uint32_t tex_top_level_from() {
+    static const uint32_t n = static_cast<uint32_t>(std::clamp<int64_t>(config_get_int("nvn", "texture_top_level_from", 1024), 0, 1 << 20));
+    return n;
+}
+std::atomic<uint64_t> g_reduced_made{0}, g_reduced_restored{0};
+
 uint32_t tex_idle_presents() {
     static const uint32_t n = device().image_memory_priority_adjustable()
-                                  ? static_cast<uint32_t>(std::clamp<int64_t>(config_get_int("nvn", "texture_idle_presents", 1800), 0, 1 << 24)) : 0;
+                                  ? static_cast<uint32_t>(std::clamp<int64_t>(config_get_int("nvn", "texture_idle_presents", 0), 0, 1 << 24)) : 0;
     return n;
 }
 
@@ -610,6 +627,8 @@ struct TexCensusGauges {
         nxrt::gauge_register("nvn.tex.never_sampled_mb", [] { return tex_census().never >> 20; });
         nxrt::gauge_register("nvn.tex.idle_600_mb", [] { return tex_census().idle_600 >> 20; });
         nxrt::gauge_register("nvn.tex.idle_3600_mb", [] { return tex_census().idle_3600 >> 20; });
+        nxrt::gauge_register("nvn.tex.reduced", [] { return static_cast<int64_t>(g_reduced_made.load() - g_reduced_restored.load()); });
+        nxrt::gauge_register("nvn.tex.reduced_restored", [] { return static_cast<int64_t>(g_reduced_restored.load()); });
         nxrt::gauge_register("nvn.tex.own_memory_mb", [] { return tex_census().own_memory >> 20; });
         nxrt::gauge_register("nvn.tex.low_priority_mb", [] { return tex_census().demoted >> 20; });
         nxrt::gauge_register("nvn.tex.never_sampled", [] { return tex_census().count_never; });
@@ -618,7 +637,7 @@ struct TexCensusGauges {
     ~TexCensusGauges() {
         for (const char* n : {"nvn.tex.astc_mb", "nvn.tex.astc_native_mb", "nvn.tex.compressed_mb", "nvn.tex.plain_mb", "nvn.tex.depth_mb",
                               "nvn.tex.never_sampled_mb", "nvn.tex.idle_600_mb", "nvn.tex.idle_3600_mb", "nvn.tex.never_sampled", "nvn.tex.idle_3600",
-                              "nvn.tex.own_memory_mb", "nvn.tex.low_priority_mb"})
+                              "nvn.tex.own_memory_mb", "nvn.tex.low_priority_mb", "nvn.tex.reduced", "nvn.tex.reduced_restored"})
             nxrt::gauge_unregister(n);
     }
 };
@@ -746,6 +765,15 @@ TexGpu* create_texture_gpu(Texture* t, float want_scale) {
         }
     }
     std::string why2;
+    if (g->transcoded && !t->want_full_detail.load(std::memory_order_relaxed) && tex_top_level_from() && s.type == VK_IMAGE_TYPE_2D && s.samples == 1 && s.levels >= 2 &&
+        std::max(s.base.width, s.base.height) >= tex_top_level_from() && g->scale == 1.0f) {
+        g->skip = 1;
+        is.base = level_extent(s.base, 1);
+        is.levels = s.levels - 1;
+        g->base = is.base;
+        g->levels = is.levels;
+        g_reduced_made.fetch_add(1, std::memory_order_relaxed);
+    }
     gfx::ImageDesc idesc = make_desc(is, chosen, usage, flags);
     // A block-compressed texture of some size gets memory of its own: it is only ever sampled, and tex_idle_sweep can then lower the
     // priority of that memory alone while no draw uses the texture (inside a shared block the neighbours would go with it).
@@ -758,9 +786,9 @@ TexGpu* create_texture_gpu(Texture* t, float want_scale) {
         const bool bc8 = chosen >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && chosen <= VK_FORMAT_BC1_RGBA_SRGB_BLOCK;
         const bool bc4 = chosen == VK_FORMAT_BC4_UNORM_BLOCK || chosen == VK_FORMAT_BC4_SNORM_BLOCK;
         if (is_block_format(chosen) && (g->transcoded || !g->fmt->compressed))
-            g->est_bytes = estimate_image_bytes(is.base, s.levels, s.layers, s.samples, 4, 4, bc8 || bc4 ? 8 : 16);
+            g->est_bytes = estimate_image_bytes(is.base, is.levels, s.layers, s.samples, 4, 4, bc8 || bc4 ? 8 : 16);
         else if (g->transcoded || g->promoted)   // RGBA8 for an ASTC texture BC7 cannot reproduce; RGBA16F for a promoted target
-            g->est_bytes = estimate_image_bytes(is.base, s.levels, s.layers, s.samples, 1, 1, g->promoted ? 8 : 4);
+            g->est_bytes = estimate_image_bytes(is.base, is.levels, s.layers, s.samples, 1, 1, g->promoted ? 8 : 4);
         else
             g->est_bytes = estimate_image_bytes(is.base, s.levels, s.layers, s.samples, g->fmt->block_w, g->fmt->block_h, g->fmt->bytes);
         if (g->transcoded) g->est_native_bytes = estimate_image_bytes(is.base, s.levels, s.layers, s.samples, g->fmt->block_w, g->fmt->block_h, g->fmt->bytes);
@@ -1530,7 +1558,7 @@ float tex_scale(Texture* t) {
 
 VkExtent3D tex_image_extent(Texture* t, uint32_t level) {
     TexGpu* g = tex_or_null(t);
-    return g ? level_extent(g->base, level) : tex_extent(t, level);
+    return g ? level_extent(g->base, level > g->skip ? level - g->skip : 0) : tex_extent(t, level);
 }
 
 float tex_scale_wanted(Texture* t) {
@@ -1604,6 +1632,49 @@ bool tex_rescale(Texture* t, Frame& f, float to, const char* why) {
     if (to == 1.0f) g->scale_blocked = true;
     pool_texture_remade(t);
     return true;
+}
+
+// A reduced texture (TexGpu::skip) named by something that addresses its levels in texels (a copy, a clear): the image is made again with
+// every level and the storage is uploaded again at the next tex_ensure_current. It stays whole from then on.
+void tex_full_detail(Texture* t) {
+    if (!t) return;
+    t->want_full_detail.store(true, std::memory_order_relaxed);
+    TexGpu* g = t->gpu;
+    if (!g || g->failed || !g->skip) return;
+    const Shape s = shape_of(*t);
+    gfx::Image ni;
+    std::string err;
+    if (device().create_image(make_desc(s, g->format, g->usage, base_flags(s, g->format)), &ni, &err) != VK_SUCCESS) {
+        NXLOG_W(kTag, "texture %u: cannot remake it with its first level (%s): it stays reduced", t->id, err.c_str());
+        return;
+    }
+    static int logged = 0;
+    if (logged++ < 40)
+        NXLOG_I(kTag, "texture %u: %s %dx%d is copied or cleared: made again with its first level", t->id, g->fmt ? g->fmt->name : "?", t->b.width, t->b.height);
+    gfx::Image old = g->img;
+    if (g->presented) device().wait_idle();
+    g->presented = false;
+    std::vector<VkImageView> views;
+    for (auto& kv : g->views) views.push_back(kv.second);
+    g->views.clear();
+    g->last_view = VK_NULL_HANDLE;
+    defer_destroy([old, views]() mutable {
+        for (VkImageView v : views) { vkDestroyImageView(vkdev(), v, nullptr); vk_gauge_image_views().sub(1); }
+        device().destroy_image(old);
+    });
+    g->img = ni;
+    g->base = s.base;
+    g->levels = s.levels;
+    g->skip = 0;
+    g->full_detail = true;
+    g->demoted.store(false, std::memory_order_relaxed);
+    g->layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    g->uploaded = false;
+    g->gpu_written = false;
+    g->est_bytes = estimate_image_bytes(s.base, s.levels, s.layers, s.samples, 4, 4, 16);
+    t->cpu_dirty.store(true);
+    g_reduced_restored.fetch_add(1, std::memory_order_relaxed);
+    pool_texture_remade(t);
 }
 
 void tex_poll_cpu_writes() {
@@ -1957,15 +2028,16 @@ void tex_ensure_current(Texture* t, Frame& f) {
     if (!staged) std::memcpy(st.ptr, prep.data.data(), static_cast<size_t>(bytes));
     std::vector<VkBufferImageCopy> regions;
     regions.reserve(prep.level.size());
-    for (uint32_t i = 0; i < prep.level.size(); ++i) {
+    for (uint32_t i = g->skip; i < prep.level.size() && i - g->skip < g->levels; ++i) {   // a reduced image has no place for the first level
         const PreparedLevel& pl = prep.level[i];
         VkBufferImageCopy r = {};
         r.bufferOffset = st.offset + pl.offset;
-        r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i, 0, g->layers};
+        r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i - g->skip, 0, g->layers};
         r.imageExtent = {pl.width, pl.height, pl.depth};
         regions.push_back(r);
     }
-    copy_regions_to_image(f, *g, st.buffer, regions);
+    if (regions.empty()) fill_zero(f, *g);
+    else copy_regions_to_image(f, *g, st.buffer, regions);
     if (arm_later) tex_ww_arm_later(t, *g, have_hash, content_hash);
     g->uploaded = true;
     g->gpu_written = false;
@@ -2032,9 +2104,20 @@ VkImageView tex_sampled_view(Texture* t, const ViewRequest& req) {
     }
     const bool is3d = g->type == VK_IMAGE_TYPE_3D;
     const uint32_t total_layers = is3d ? g->base.depth : g->layers;   // 3D images: the slices are the layers of 2D views
-    const uint32_t bl = req.base_level;
-    if (bl >= g->levels) return bad_view(*t, "base level out of range");
-    const uint32_t nl = req.level_count ? req.level_count : g->levels - bl;
+    uint32_t bl = req.base_level;
+    uint32_t nl = 0;
+    if (g->skip) {   // NVN levels to the reduced image's: a range that starts in the missing level starts at the image's first
+        const uint32_t nvn_levels = g->levels + g->skip;
+        if (bl >= nvn_levels) return bad_view(*t, "base level out of range");
+        const uint32_t end = req.level_count ? bl + req.level_count : nvn_levels;
+        if (end <= bl || end > nvn_levels) return bad_view(*t, "level range out of range");
+        const uint32_t ib = bl > g->skip ? bl - g->skip : 0, ie = std::max(end, g->skip + 1) - g->skip;
+        bl = ib;
+        nl = ie - ib;
+    } else {
+        if (bl >= g->levels) return bad_view(*t, "base level out of range");
+        nl = req.level_count ? req.level_count : g->levels - bl;
+    }
     if (nl == 0 || bl + nl > g->levels) return bad_view(*t, "level range out of range");
     const uint32_t bly = req.base_layer;
     uint32_t nly = 1;

@@ -163,6 +163,7 @@ struct Texture : Obj {
     uint32_t levels = 1, layers = 1;        // levels clamped to the size; layers = array size / cube faces * count
     uint32_t id = 0;                        // unique, for logs
     std::atomic<bool> cpu_dirty{true};      // the CPU may have written the storage since the last upload
+    std::atomic<bool> want_full_detail{false};   // named by a copy or a clear: its image keeps every level ([nvn] texture_top_level_from)
     std::atomic<bool> destroyed{false};     // finalized by the game
     // Background preparation of the upload data (nvn_texprep.cpp). prep_gen counts the CPU-write notifications; a prepared result is only used
     // when the count has not moved since the job read the storage.

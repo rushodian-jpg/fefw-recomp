@@ -1119,6 +1119,7 @@ void vol3d_prepare(const ProgLayout& pl) {
         const DescriptorBinding& b = d.shader->refl.bindings[d.index];
         if (b.nvn.source != NvnSource::SamplerBinding && b.nvn.source != NvnSource::HandleInUniform) continue;
         const TexResolved r = resolve_texture(d);
+        if (wants_vol3d(b, r)) tex_full_detail(r.tex);   // the copy below addresses its levels in texels
         if (!wants_vol3d(b, r) || g_vol3d_use.count(r.tex) || !tex_gpu(r.tex)) continue;
         const uint32_t layer = r.has_view && r.view.has_layers ? static_cast<uint32_t>(r.view.min_layer) : 0;
         if (layer >= tex_layers(r.tex)) continue;
@@ -3427,6 +3428,7 @@ SubRes sub_of(const TextureViewInfo& v, bool has_view) {
 
 void do_clear_texture(const P_ClearTexture& p) {
     Texture* t = p.tex;
+    tex_full_detail(t);
     if (!t || !tex_gpu(t)) return;
     end_pass();
     SubRes s = sub_of(p.view, p.has_view);
@@ -3465,6 +3467,7 @@ void do_copy_buffer_texture(const P_CopyBufTex& p, bool to_texture) {
                     static_cast<long long>(p.row_stride), static_cast<long long>(p.image_stride));
         }
     }
+    tex_full_detail(t);
     if (!t || !tex_gpu(t)) return;
     end_pass();
     if (tex_scale(t) != 1.0f) {
@@ -3517,6 +3520,8 @@ void do_copy_buffer_texture(const P_CopyBufTex& p, bool to_texture) {
 
 void do_copy_texture_texture(const P_CopyTexTex& p) {
     Texture *s = p.src, *d = p.dst;
+    tex_full_detail(s);
+    tex_full_detail(d);
     if (!s || !d || !tex_gpu(s) || !tex_gpu(d)) return;
     end_pass();
     const SubRes ss = sub_of(p.src_view, p.has_src_view), ds = sub_of(p.dst_view, p.has_dst_view);

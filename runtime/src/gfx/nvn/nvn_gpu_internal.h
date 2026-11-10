@@ -304,6 +304,7 @@ bool snapshot_write(int index, const std::string& png_path, std::string* stats);
 // [nvn] trace_dump_tex = <dir>: writes the data prepare_texture builds for t (raw blocks of every level and layer) as t<id>.bin with a t<id>.txt describing it, once per texture.
 void trace_dump_prepared(Texture* t, const std::string& dir);
 int snapshot_record_raw(Texture* t, Frame& f);   // block-compressed level 0 as the GPU holds it; snapshot_write writes the bytes
+void tex_full_detail(Texture* t);  // render thread: a texture whose image left out its first level is made whole (before a copy or clear addresses its levels)
 void tex_idle_sweep();             // once a present, render thread: textures no draw sampled for a while get a low memory priority
 void tex_destroy(TexGpu* g);      // render thread
 void tex_shutdown();              // frees samplers and dummy resources (device idle)
