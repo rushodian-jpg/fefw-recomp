@@ -88,6 +88,10 @@ struct TexGpu {
     // draw last asked for a sampled view of it
     uint64_t est_bytes = 0, est_native_bytes = 0;
     std::atomic<uint32_t> sampled_at{0};                // present count + 1 at the last tex_sampled_view; 0: never
+    // idle textures (tex_idle_sweep): an image with memory of its own that no draw sampled for a while has its memory priority lowered,
+    // so that video memory over the budget is taken from it first; the next tex_sampled_view raises it again
+    uint32_t created_at = 0;                            // present count when the image was made
+    std::atomic<bool> demoted{false};
 };
 
 // A virtual-pool texture too big to back fully (Mario Kart World's terrain virtual texture caches: 8192x8192 arrays of 68 layers, 1.4 to
@@ -517,6 +521,23 @@ bool create_sparse_texture(Texture* t, TexGpu* g, const Shape& s, std::string* w
 
 // ---- creation -------------------------------------------------------------------------------------------------------------
 // Makes the image of t (or the failed marker when no format works). Stores the result in t->gpu, which is never null afterwards.
+// ---- idle textures ------------------------------------------------------------------------------------------------------------------
+// The game keeps the textures of places it left, and the GPU cannot tell them from the ones a draw needs: with video memory over the
+// budget the system moves memory out by priority (VK_EXT_pageable_device_local_memory), and every texture has the same one. So a texture
+// with memory of its own that no draw has sampled for [nvn] texture_idle_presents presents (1800: half a minute at 60 fps; 0 turns this
+// off) is set to the lowest priority, and back to the normal one at its next tex_sampled_view. Nothing is freed and no data is lost: a
+// lowered texture that is sampled again is at worst brought back by the driver.
+constexpr float kTexPriority = 0.5f;                    // Device::create_image's priority of a sampled image
+constexpr float kTexIdlePriority = 0.0f;
+constexpr uint64_t kOwnMemoryTexels = 512ull * 512;     // smaller textures stay in the allocator's shared blocks
+std::atomic<uint64_t> g_idle_lowered{0}, g_idle_raised{0};
+
+uint32_t tex_idle_presents() {
+    static const uint32_t n = device().image_memory_priority_adjustable()
+                                  ? static_cast<uint32_t>(std::clamp<int64_t>(config_get_int("nvn", "texture_idle_presents", 1800), 0, 1 << 24)) : 0;
+    return n;
+}
+
 // ---- the texture census (gauges nvn.tex.*, read by the soak sampler) ---------------------------------------------------------------
 // Estimated device memory of an image: every level, layer and sample at the format's size (alignment and allocator overhead not counted).
 // `block_w`, `block_h`, `unit`: texels per block and bytes per block (1, 1 and the bytes of a texel for an uncompressed format).
@@ -540,6 +561,8 @@ struct TexCensus {
     int64_t idle_600 = 0;      // sampled, but not in the last 600 presents (10 s at 60 fps)
     int64_t idle_3600 = 0;     // ... not in the last 3600 presents (a minute)
     int64_t count_never = 0, count_idle_3600 = 0;
+    int64_t own_memory = 0;    // images with a memory allocation of their own (the ones tex_idle_sweep can lower)
+    int64_t demoted = 0;       // ... of those, at the low priority now
 };
 
 // One walk of the live images serves all the gauges of a sampler pass (they are read back to back).
@@ -561,6 +584,8 @@ TexCensus tex_census() {
             else if (g->depth) c.depth += b;
             else if (g->fmt && g->fmt->compressed) c.compressed += b;
             else c.plain += b;
+            if (g->img.own_memory) c.own_memory += b;
+            if (g->demoted.load(std::memory_order_relaxed)) c.demoted += b;
             const uint32_t sa = g->sampled_at.load(std::memory_order_relaxed);
             if (!sa) { c.never += b; ++c.count_never; }
             else {
@@ -585,12 +610,15 @@ struct TexCensusGauges {
         nxrt::gauge_register("nvn.tex.never_sampled_mb", [] { return tex_census().never >> 20; });
         nxrt::gauge_register("nvn.tex.idle_600_mb", [] { return tex_census().idle_600 >> 20; });
         nxrt::gauge_register("nvn.tex.idle_3600_mb", [] { return tex_census().idle_3600 >> 20; });
+        nxrt::gauge_register("nvn.tex.own_memory_mb", [] { return tex_census().own_memory >> 20; });
+        nxrt::gauge_register("nvn.tex.low_priority_mb", [] { return tex_census().demoted >> 20; });
         nxrt::gauge_register("nvn.tex.never_sampled", [] { return tex_census().count_never; });
         nxrt::gauge_register("nvn.tex.idle_3600", [] { return tex_census().count_idle_3600; });
     }
     ~TexCensusGauges() {
         for (const char* n : {"nvn.tex.astc_mb", "nvn.tex.astc_native_mb", "nvn.tex.compressed_mb", "nvn.tex.plain_mb", "nvn.tex.depth_mb",
-                              "nvn.tex.never_sampled_mb", "nvn.tex.idle_600_mb", "nvn.tex.idle_3600_mb", "nvn.tex.never_sampled", "nvn.tex.idle_3600"})
+                              "nvn.tex.never_sampled_mb", "nvn.tex.idle_600_mb", "nvn.tex.idle_3600_mb", "nvn.tex.never_sampled", "nvn.tex.idle_3600",
+                              "nvn.tex.own_memory_mb", "nvn.tex.low_priority_mb"})
             nxrt::gauge_unregister(n);
     }
 };
@@ -718,8 +746,14 @@ TexGpu* create_texture_gpu(Texture* t, float want_scale) {
         }
     }
     std::string why2;
-    if (device().create_image(make_desc(is, chosen, usage, flags), &g->img, &why2) != VK_SUCCESS)
+    gfx::ImageDesc idesc = make_desc(is, chosen, usage, flags);
+    // A block-compressed texture of some size gets memory of its own: it is only ever sampled, and tex_idle_sweep can then lower the
+    // priority of that memory alone while no draw uses the texture (inside a shared block the neighbours would go with it).
+    idesc.own_memory = tex_idle_presents() != 0 && is_block_format(chosen) &&
+                       static_cast<uint64_t>(is.base.width) * is.base.height * std::max<uint32_t>(1, is.base.depth) * std::max<uint32_t>(1, s.layers) >= kOwnMemoryTexels;
+    if (device().create_image(idesc, &g->img, &why2) != VK_SUCCESS)
         return fail("create_image: " + why2);
+    g->created_at = static_cast<uint32_t>(counters().presents.load(std::memory_order_relaxed));
     {   // the census: the image's size in its format, and for an ASTC stand-in the size of the ASTC it replaces
         const bool bc8 = chosen >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && chosen <= VK_FORMAT_BC1_RGBA_SRGB_BLOCK;
         const bool bc4 = chosen == VK_FORMAT_BC4_UNORM_BLOCK || chosen == VK_FORMAT_BC4_SNORM_BLOCK;
@@ -1992,6 +2026,10 @@ VkImageView tex_sampled_view(Texture* t, const ViewRequest& req) {
     TexGpu* g = tex_or_null(t);
     if (!g) return VK_NULL_HANDLE;
     g->sampled_at.store(static_cast<uint32_t>(counters().presents.load(std::memory_order_relaxed)) + 1, std::memory_order_relaxed);
+    if (g->demoted.load(std::memory_order_relaxed) && g->demoted.exchange(false)) {   // in use again: back among the textures that stay
+        device().set_image_memory_priority(g->img, kTexPriority);
+        g_idle_raised.fetch_add(1, std::memory_order_relaxed);
+    }
     const bool is3d = g->type == VK_IMAGE_TYPE_3D;
     const uint32_t total_layers = is3d ? g->base.depth : g->layers;   // 3D images: the slices are the layers of 2D views
     const uint32_t bl = req.base_level;
@@ -2232,6 +2270,41 @@ VkSampler sampler_for(const SamplerInfo& game_sampler) {
     bucket.emplace_back(s, v);
     last[last_next++ % 4] = {game_sampler, aniso, bias, v};
     return v;
+}
+
+// Once every kIdleSweepEvery presents (render thread): lowers the memory priority of the textures no draw sampled for tex_idle_presents()
+// presents. At most kIdleSweepMax per pass, so leaving a large place does not put thousands of driver calls in one frame.
+void tex_idle_sweep() {
+    constexpr uint32_t kIdleSweepEvery = 30, kIdleSweepMax = 128;
+    const uint32_t idle = tex_idle_presents();
+    if (!idle) return;
+    const uint32_t presents = static_cast<uint32_t>(counters().presents.load(std::memory_order_relaxed));
+    if (presents % kIdleSweepEvery) return;
+    uint32_t done = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_live_mu);
+        for (TexGpu* g : g_live_set) {
+            if (!g->img.own_memory || g->failed || g->demoted.load(std::memory_order_relaxed)) continue;
+            const uint32_t sa = g->sampled_at.load(std::memory_order_relaxed);
+            const uint32_t last = sa ? sa - 1 : g->created_at;   // never sampled: idle since it was made
+            if (presents - last < idle) continue;
+            if (!device().set_image_memory_priority(g->img, kTexIdlePriority)) continue;
+            g->demoted.store(true, std::memory_order_relaxed);
+            if (++done >= kIdleSweepMax) break;
+        }
+    }
+    if (done) g_idle_lowered.fetch_add(done, std::memory_order_relaxed);
+    static uint32_t logged_at = 0;
+    static uint64_t logged_lowered = 0;
+    const uint64_t lowered = g_idle_lowered.load(std::memory_order_relaxed);
+    if (presents - logged_at >= 3600 && lowered != logged_lowered) {
+        logged_at = presents;
+        logged_lowered = lowered;
+        const TexCensus c = tex_census();
+        NXLOG_I(kTag, "idle textures: %lld MB at the low memory priority, of %lld MB with memory of their own; lowered %llu, raised again %llu (idle after %u presents)",
+                static_cast<long long>(c.demoted >> 20), static_cast<long long>(c.own_memory >> 20), static_cast<unsigned long long>(lowered),
+                static_cast<unsigned long long>(g_idle_raised.load(std::memory_order_relaxed)), idle);
+    }
 }
 
 void tex_destroy(TexGpu* g) {
