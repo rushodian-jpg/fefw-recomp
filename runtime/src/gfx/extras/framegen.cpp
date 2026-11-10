@@ -128,7 +128,7 @@ bool base_init() {
         ro.mode = sl::ReflexMode::eLowLatency;
         ro.frameLimitUs = 0;   // the runtime's limiter paces the game
         const sl::Result r = s.f.reflex_set(ro);
-        s.markers = r == sl::Result::eOk;
+        s.markers = streamline_ok(static_cast<int>(r), "slReflexSetOptions");
         if (!s.markers) NXLOG_W(kTag, "slReflexSetOptions failed (%d): frame generation off", static_cast<int>(r));
         else NXLOG_I(kTag, "Reflex on (low latency), PCL markers from the render thread");
     }
@@ -166,7 +166,7 @@ bool fg_init(State& s, gfx::Device* dev) {
     }
     if (!feature_fn(s, sl::kFeatureDLSS_G, "slDLSSGSetOptions", s.f.fg_set) || !feature_fn(s, sl::kFeatureDLSS_G, "slDLSSGGetState", s.f.fg_get)) return false;
     sl::DLSSGState gs;
-    if (s.f.fg_get(sl::ViewportHandle(0u), gs, nullptr) != sl::Result::eOk) {
+    if (!streamline_ok(static_cast<int>(s.f.fg_get(sl::ViewportHandle(0u), gs, nullptr)), "slDLSSGGetState")) {
         NXLOG_W(kTag, "DLSS-G state unavailable: frame generation off");
         return false;
     }
