@@ -2,7 +2,7 @@
 name: Build fefw_rt.dll
 on:
   push:
-    branches: [build/rt-dll]
+    branches: ["build/**"]
   workflow_dispatch:
 permissions:
   contents: read
