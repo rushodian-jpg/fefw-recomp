@@ -1,0 +1,87 @@
+# Builds fefw_rt.dll (the runtime; no game code or data) from this branch, for testing a change before a release has it.
+name: Build fefw_rt.dll
+on:
+  push:
+    branches: ["build/**"]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        llvm: [image]   # image: the runner's own LLVM; release (the newest LLVM release, 23 or newer) unpacks too slowly here
+    steps:
+      - uses: actions/checkout@v4
+      - name: The runner's LLVM
+        if: matrix.llvm == 'image'
+        shell: pwsh
+        run: '& "C:\Program Files\LLVM\bin\clang-cl.exe" --version'
+      - name: Download LLVM (23 or newer)
+        if: matrix.llvm == 'release'
+        timeout-minutes: 15
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # the newest release (23 or newer) that has the x86-64 Windows package: a point release may not have it yet
+          $tags = gh release list -R llvm/llvm-project --limit 30 --exclude-pre-releases --json tagName -q '.[].tagName'
+          foreach ($tag in $tags) {
+              $ver = $tag -replace '^llvmorg-', ''
+              if ($ver -notmatch '^\d+\.' -or [int]($ver.Split('.')[0]) -lt 23) { continue }
+              $names = gh release view $tag -R llvm/llvm-project --json assets -q '.assets[].name'
+              $name = $names | Where-Object { $_ -match '^clang\+llvm-.*-x86_64-pc-windows-msvc\.tar\.xz$' } | Select-Object -First 1
+              if (-not $name) { continue }
+              Write-Host "LLVM $ver`: $name"
+              curl.exe -fL --retry 3 -o "$env:RUNNER_TEMP\llvm.tar.xz" "https://github.com/llvm/llvm-project/releases/download/$tag/$name"
+              if ($LASTEXITCODE) { throw "download failed" }
+              Get-Item "$env:RUNNER_TEMP\llvm.tar.xz" | Format-List Name, Length
+              exit 0
+          }
+          throw "no LLVM release from 23 on with an x86-64 Windows package"
+      - name: Unpack LLVM
+        if: matrix.llvm == 'release'
+        timeout-minutes: 40
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force C:\LLVM23 | Out-Null
+          # Windows' own tar (bsdtar): Git's GNU tar takes the drive letter of a path for a remote host. Only the tools and clang's headers.
+          & "$env:SystemRoot\System32\tar.exe" -xf "$env:RUNNER_TEMP\llvm.tar.xz" -C C:\LLVM23 --strip-components=1 '*/bin/clang*' '*/bin/lld*' '*/bin/llvm-rc*' '*/bin/llvm-lib*' '*/bin/llvm-ar*' '*/bin/llvm-mt*' '*/bin/llvm-ranlib*' '*/bin/*.dll' '*/lib/clang/*'
+          if ($LASTEXITCODE) { throw "tar failed" }
+          Get-ChildItem C:\LLVM23\bin | Format-Table Name, Length
+          & 'C:\LLVM23\bin\clang-cl.exe' --version
+          "NX_LLVM_BIN=C:\LLVM23\bin" >> $env:GITHUB_ENV
+      - name: Ninja
+        shell: pwsh
+        run: |
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y --no-progress }
+          ninja --version
+      # dav1d's assembly: without it AV1 movies decode several times slower
+      - name: NASM
+        shell: pwsh
+        run: |
+          choco install nasm -y --no-progress
+          $dir = 'C:\Program Files\NASM'
+          & "$dir\nasm.exe" -v
+          $dir >> $env:GITHUB_PATH
+      - name: Texture transcoder sources
+        shell: pwsh
+        run: pwsh -File tools\textures\scripts\fetch_third_party.ps1
+      - name: Build fefw_rt.dll
+        shell: pwsh
+        run: pwsh -File game-build\scripts\build_fefw.ps1 -Target fefw_rt -BuildDir build\rtdll -CMakeArgs "-DFEFW_RT_DLL=ON -DNXRT_DAV1D_ASM=ON -DCMAKE_SHARED_LINKER_FLAGS=/MAP" -Jobs 4
+      - name: Hashes
+        shell: pwsh
+        run: Get-ChildItem game-build\fefw\build\rtdll -File | Where-Object { $_.Extension -in '.dll', '.lib' } | Get-FileHash -Algorithm SHA256 | Format-List
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fefw_rt-llvm-${{ matrix.llvm }}
+          path: |
+            game-build/fefw/build/rtdll/fefw_rt.dll
+            game-build/fefw/build/rtdll/fefw_rt.lib
+            game-build/fefw/build/rtdll/fefw_rt.map
+          if-no-files-found: warn
