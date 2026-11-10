@@ -268,7 +268,7 @@ void set_mode(State& s, bool on) {
     o.queueParallelismMode = sl::DLSSGQueueParallelismMode::eBlockPresentingClientQueue;
     o.onErrorCallback = &on_api_error;
     const sl::Result r = s.f.fg_set(sl::ViewportHandle(0u), o);
-    if (r != sl::Result::eOk) {
+    if (!streamline_ok(static_cast<int>(r), "slDLSSGSetOptions")) {   // eWarnOutOfVRAM is not a failure: the options were set
         NXLOG_E(kTag, "slDLSSGSetOptions failed (%d): frame generation off", static_cast<int>(r));
         s.fg = false;
         s.on = false;
