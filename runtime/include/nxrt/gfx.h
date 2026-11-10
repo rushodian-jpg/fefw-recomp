@@ -77,6 +77,7 @@ struct ImageDesc {
     VkImageCreateFlags flags = 0;
     VkImageTiling tiling = VK_IMAGE_TILING_OPTIMAL;
     bool create_view = true;              // a view of the whole image (2D / 2D array / 3D / cube by flags and layer count)
+    bool own_memory = false;              // a device memory allocation of its own, so set_image_memory_priority can reach it
     const char* name = nullptr;           // debug name
 };
 
@@ -87,6 +88,7 @@ struct Image {
     VkFormat format = VK_FORMAT_UNDEFINED;
     VkExtent3D extent = {};
     uint32_t mip_levels = 1, array_layers = 1;
+    bool own_memory = false;              // the allocation is the image's alone (ImageDesc::own_memory, or the allocator chose so)
     explicit operator bool() const { return image != VK_NULL_HANDLE; }
 };
 
@@ -184,6 +186,12 @@ public:
     bool image_supported(const ImageDesc& d, std::string* why = nullptr);
     VkResult create_image(const ImageDesc& d, Image* out, std::string* why = nullptr);   // VK_ERROR_FORMAT_NOT_SUPPORTED when refused
     void destroy_image(Image& img);
+    // Video memory over the budget: the system moves the allocations with the lowest priority out of video memory first
+    // (VK_EXT_pageable_device_local_memory). True when image priorities can be changed after creation on this device.
+    bool image_memory_priority_adjustable() const { return memory_priority_adjustable_; }
+    // Sets the priority (0 lowest to 1) of the image's memory. Only an image with a memory allocation of its own is changed (an
+    // image inside a shared block would drag its neighbours along); false when nothing was done.
+    bool set_image_memory_priority(const Image& img, float priority);
     FormatCheckStats format_check_stats() const;
 
     VkResult create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, MemoryUse use, Buffer* out, const char* name = nullptr);
@@ -226,6 +234,7 @@ private:
     bool validation_ = false;
     bool debug_utils_ = false;
     bool owns_platform_surface_ = false;
+    bool memory_priority_adjustable_ = false;
     Impl* impl_ = nullptr;
 };
 

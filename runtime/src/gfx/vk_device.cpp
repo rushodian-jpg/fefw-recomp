@@ -845,6 +845,7 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
     if (x_membudget) aci.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
     const bool mem_priority = x_mpri && ampri.memoryPriority;
     if (mem_priority) aci.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_PRIORITY_BIT;
+    memory_priority_adjustable_ = mem_priority && x_page && apage.pageableDeviceLocalMemory && vkSetDeviceMemoryPriorityEXT != nullptr;
     NXLOG_I(kTag, "video memory over the budget: memory priority %d, pageable device-local memory %d ([gfx] pageable_memory = %d)",
             mem_priority, x_page && apage.pageableDeviceLocalMemory, want_pageable);
     NXLOG_I(kTag, "video memory budget: %s", x_membudget ? "from the OS (VK_EXT_memory_budget)" : "estimated (no VK_EXT_memory_budget)");
@@ -987,6 +988,7 @@ VkResult Device::create_image(const ImageDesc& d, Image* out, std::string* why) 
     // VK_EXT_memory_priority (used for a dedicated allocation; ignored without the extension): what is rendered to stays in video memory
     // before what is only sampled. Zero, the default, would make every large image the first to go.
     ai.priority = (d.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) ? 1.0f : 0.5f;
+    if (d.own_memory && memory_priority_adjustable_) ai.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
     Image img;
     VkImage handle = VK_NULL_HANDLE;
     VmaAllocation alloc = nullptr;
@@ -1005,6 +1007,7 @@ VkResult Device::create_image(const ImageDesc& d, Image* out, std::string* why) 
     }
     img.image = handle;
     img.allocation = alloc;
+    img.own_memory = (ai.flags & VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT) != 0;
     img.format = d.format;
     img.extent = ci.extent;
     img.mip_levels = d.mip_levels;
@@ -1039,6 +1042,16 @@ void Device::destroy_image(Image& img) {
 }
 
 // ---- buffers ----------------------------------------------------------------------------------------------------------
+
+bool Device::set_image_memory_priority(const Image& img, float priority) {
+    if (!memory_priority_adjustable_ || !img.own_memory || !img.allocation) return false;
+    VmaAllocationInfo inf{};
+    vmaGetAllocationInfo(vma_, img.allocation, &inf);
+    if (inf.deviceMemory == VK_NULL_HANDLE || inf.offset != 0) return false;   // not alone in its memory after all
+    vkSetDeviceMemoryPriorityEXT(device_, inf.deviceMemory, priority);
+    return true;
+}
+
 VkResult Device::create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, MemoryUse use, Buffer* out, const char* name) {
     VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bi.size = size;

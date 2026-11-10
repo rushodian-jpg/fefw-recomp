@@ -120,7 +120,10 @@ void present_on_render_thread(Window* w, int index, bool again) {
     if (!w || index < 0 || static_cast<size_t>(index) >= w->textures.size()) return;
     Texture* t = w->textures[index].get();
     if (!t) return;
-    if (!again) counters().presents.fetch_add(1, std::memory_order_relaxed);
+    if (!again) {
+        counters().presents.fetch_add(1, std::memory_order_relaxed);
+        tex_idle_sweep();
+    }
     // the freeze watchdog counts presented frames (and the test runner its frames); a frame shown again while the game waits on the player counts too
     { NXFT("present.frame_tick"); diag_frame_tick(); }
     if (!rend || !pp) return;
