@@ -20,6 +20,7 @@
 #include "nxrt/extras.h"
 #include "nxrt/gfx.h"
 #include "nxrt/log.h"
+#include "vk_gauges.h"
 
 #include "../../../third_party/nvidia_streamline/include/sl.h"
 #include "../../../third_party/nvidia_streamline/include/sl_consts.h"
@@ -209,8 +210,14 @@ public:
         if (s.tag(*frame, vp, tags, 4, slcb) != sl::Result::eOk) return fail("slSetTagForFrame");
         const sl::BaseStructure* inputs[] = {&vp};
         const sl::Result er = s.evaluate(sl::kFeatureDLSS, *frame, inputs, 1, slcb);
-        // eWarnOutOfVRAM: the evaluation ran (Streamline only replaces eOk with it), so the output is valid and DLSS stays on.
+        // eWarnOutOfVRAM: the evaluation ran (Streamline only replaces eOk with it), so this frame's output is valid.
         if (!streamline_ok(static_cast<int>(er), "slEvaluateFeature")) return fail("slEvaluateFeature", static_cast<int>(er));
+        if (er == sl::Result::eWarnOutOfVRAM && vram_fallback_due()) {
+            NXLOG_E(kTag, "the video memory budget stayed used up for %u s with frame generation off and the driver refused allocations: DLSS off", kWarnPersistMs / 1000);
+            failed_ = true;   // from the next frame on; this one was evaluated
+        } else if (er != sl::Result::eWarnOutOfVRAM) {
+            warn_since_ms_ = 0;
+        }
         return true;
     }
 
@@ -256,6 +263,26 @@ private:
         failed_ = true;
         return false;
     }
+    // After an evaluation that returned eWarnOutOfVRAM: whether DLSS should give way to the built-in upscaler. Frame generation sheds its
+    // memory first (framegen.cpp), so the warnings only count while it is not generating; and the warning alone is not harm (Streamline
+    // keeps reporting it on a card that runs at its budget with nothing failing), so the driver must also have refused an allocation
+    // since the warnings began.
+    static constexpr uint32_t kWarnPersistMs = 20000;
+    bool vram_fallback_due() {
+        const uint64_t now = GetTickCount64();
+        if (framegen_generating()) {
+            warn_since_ms_ = 0;
+            return false;
+        }
+        if (!warn_since_ms_ || now - warn_last_ms_ > 5000) {   // the first warning of a run
+            warn_since_ms_ = now;
+            warn_failures0_ = vk_gauge_memory_failures().get();
+        }
+        warn_last_ms_ = now;
+        return now - warn_since_ms_ >= kWarnPersistMs && vk_gauge_memory_failures().get() > warn_failures0_;
+    }
+    uint64_t warn_since_ms_ = 0, warn_last_ms_ = 0;
+    int64_t warn_failures0_ = 0;
     gfx::Device* dev_;
     bool dlaa_ = false, failed_ = false;
     sl::DLSSMode last_mode_ = sl::DLSSMode::eCount;
@@ -367,15 +394,21 @@ PFN_vkGetInstanceProcAddr streamline_preinit() {
     return gipa;
 }
 
+namespace {
+std::atomic<uint64_t> g_vram_warned_ms{0};
+}
+uint64_t streamline_vram_warned_ms() { return g_vram_warned_ms.load(std::memory_order_relaxed); }
+
 bool streamline_ok(int result, const char* what) {
     const sl::Result r = static_cast<sl::Result>(result);
     if (r == sl::Result::eOk) return true;
     if (r != sl::Result::eWarnOutOfVRAM) return false;
     static std::atomic<uint64_t> last{0};
     const uint64_t now = GetTickCount64();
+    g_vram_warned_ms.store(now ? now : 1, std::memory_order_relaxed);
     uint64_t prev = last.load(std::memory_order_relaxed);
     if ((!prev || now - prev >= 30000) && last.compare_exchange_strong(prev, now ? now : 1, std::memory_order_relaxed))
-        NXLOG_W(kTag, "%s: Streamline reports the video memory budget is used up (eWarnOutOfVRAM): the call did its work, DLSS stays on; stutter is likely until memory is freed", what);
+        NXLOG_W(kTag, "%s: Streamline reports the video memory budget is used up (eWarnOutOfVRAM): the call did its work; frame generation is shed first", what);
     return true;
 }
 
