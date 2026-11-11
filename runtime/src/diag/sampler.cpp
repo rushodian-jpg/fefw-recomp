@@ -146,7 +146,7 @@ std::string frame_name(uint64_t addr, std::unordered_map<uint64_t, std::string>&
         }
     } else if (si.module != "?" && !si.module.empty()) {
         char b[32];
-        std::snprintf(b, sizeof b, "!+0x%llx", static_cast<unsigned long long>(si.offset & ~0xfffull));   // 4 KiB buckets: no symbols for other modules
+        std::snprintf(b, sizeof b, "!+0x%llx", static_cast<unsigned long long>(si.offset & ~(si.module == "fefw_rt.dll" ? 0xfull : 0xfffull)));   // profiling build: the runtime DLL at 16 bytes (its map names them), 4 KiB buckets for the rest
         n = si.module + b;
     } else n = "unknown";
     for (char& c : n)
