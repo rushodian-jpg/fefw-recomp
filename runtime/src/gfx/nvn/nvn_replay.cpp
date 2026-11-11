@@ -1223,6 +1223,30 @@ void prepare_textures(const ProgLayout& pl) {
                               [&](Texture* t) { return std::any_of(storage_bound.begin(), storage_bound.end(), [&](Texture* s) { return shares_image(t, s); }); }),
                need.end());
     if (need.empty() && need_storage.empty()) return;
+    {   // profiling build: which textures break the pass, and why
+        struct Why { uint64_t n = 0; std::string desc; };
+        static std::unordered_map<std::string, Why> why;
+        static uint64_t total = 0, in_pass = 0;
+        const bool open = P.open;
+        auto note = [&](Texture* t, const char* kind) {
+            char c[96];
+            char k[200];
+            std::snprintf(k, sizeof k, "%s t%u %s layout %d dirty %d%s", kind, t->id, tex_desc(t, c, sizeof c), static_cast<int>(tex_layout(t)), t->cpu_dirty.load() ? 1 : 0, open ? " (pass open)" : "");
+            why[k].n++;
+        };
+        for (Texture* t : need) note(t, "sampled");
+        for (Texture* t : need_storage) note(t, "storage");
+        ++total;
+        if (open) ++in_pass;
+        if (total % 20000 == 0) {
+            std::vector<std::pair<uint64_t, std::string>> v;
+            for (auto& kv : why) v.push_back({kv.second.n, kv.first});
+            std::sort(v.begin(), v.end(), [](auto& x, auto& y) { return x.first > y.first; });
+            NXLOG_I(kTag, "passbreak: %llu prepare_textures breaks (%llu with a pass open), %zu kinds; top:", static_cast<unsigned long long>(total), static_cast<unsigned long long>(in_pass), v.size());
+            for (size_t i = 0; i < v.size() && i < 14; ++i) NXLOG_I(kTag, "passbreak:   %llu x %s", static_cast<unsigned long long>(v[i].first), v[i].second.c_str());
+            why.clear();
+        }
+    }
     for (Texture* t : need) out_texture_read(t);           // an upload reads game memory: compute results held there go back first
     for (Texture* t : need_storage) out_texture_read(t);
     end_pass(true);     // layout changes and uploads follow: each carries the dependency for its own image
